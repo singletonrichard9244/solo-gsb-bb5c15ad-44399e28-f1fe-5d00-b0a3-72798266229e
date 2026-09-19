@@ -31,6 +31,14 @@ async def not_found_handler(request: Request, exc: store.MergeNotFound):
     return JSONResponse(status_code=404, content={"detail": "merge not found"})
 
 
+@app.exception_handler(store.MergePending)
+async def merge_pending_handler(request: Request, exc: store.MergePending):
+    return JSONResponse(
+        status_code=409,
+        content={"detail": "merge is pending: resolve all conflicts first"},
+    )
+
+
 @app.exception_handler(store.StaleRevision)
 async def stale_revision_handler(request: Request, exc: store.StaleRevision):
     return JSONResponse(
@@ -90,6 +98,15 @@ def create_merge(
 def get_merge(merge_id: str):
     """Status query: state, revision, open conflicts, final result."""
     return store.get_merge(merge_id)
+
+
+@app.get("/merges/{merge_id}/patch")
+def get_merge_patch(merge_id: str):
+    """Deterministic RFC 6902 patch from base_doc to the final result.
+
+    409 while the merge is pending, 404 for an unknown merge id.
+    """
+    return store.get_merge_patch(merge_id)
 
 
 @app.post("/merges/{merge_id}/resolutions")

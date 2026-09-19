@@ -1,5 +1,8 @@
 """End-to-end API tests against a temporary SQLite database."""
 
+import copy
+import hashlib
+import json
 import os
 import tempfile
 
@@ -177,6 +180,145 @@ def test_no_conflict_merge_is_immediately_resolved(client):
 
 def test_unknown_merge_404(client):
     assert client.get("/merges/does-not-exist").status_code == 404
+    assert client.get("/merges/does-not-exist/patch").status_code == 404
+
+
+def _apply_patch(doc, ops):
+    """Minimal RFC 6902 applier for verifying the served patch."""
+    for op in ops:
+        tokens = op["path"].split("/")[1:] if op["path"] else []
+        tokens = [t.replace("~1", "/").replace("~0", "~") for t in tokens]
+        if not tokens:
+            doc = op.get("value")
+            continue
+        parent = doc
+        for tok in tokens[:-1]:
+            parent = parent[tok if isinstance(parent, dict) else int(tok)]
+        last = tokens[-1]
+        key = last if isinstance(parent, dict) else int(last)
+        if op["op"] == "add":
+            if isinstance(parent, list):
+                parent.insert(key, op["value"])
+            else:
+                parent[key] = op["value"]
+        elif op["op"] == "remove":
+            del parent[key]
+        else:
+            parent[key] = op["value"]
+    return doc
+
+
+def _canonical_sha(doc):
+    return hashlib.sha256(
+        json.dumps(doc, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    ).hexdigest()
+
+
+def test_patch_pending_returns_409(client):
+    merge = create_merge(client)  # BASE/LEFT/RIGHT leave /db/host open
+    mid = merge["merge_id"]
+    resp = client.get(f"/merges/{mid}/patch")
+    assert resp.status_code == 409
+    assert "detail" in resp.json()
+
+
+def test_patch_resolved_roundtrip_and_digests(client):
+    resp = client.post(
+        "/merges",
+        json={
+            "base": {
+                "replicas": 1,
+                "image": "app:v1",
+                "db": {"host": "a", "port": 5432},
+                "tags": ["old"],
+                "removed": True,
+            },
+            "left": {
+                "replicas": 3,
+                "image": "app:v1",
+                "db": {"host": "b", "port": 5432},
+                "tags": ["old"],
+            },
+            "right": {
+                "replicas": 1,
+                "image": "app:v2",
+                "db": {"host": "c", "port": 5433},
+                "tags": ["new"],
+            },
+        },
+    )
+    mid = resp.json()["merge_id"]
+    # Resolve the single conflict (/db/host).
+    resp = client.post(
+        f"/merges/{mid}/resolutions",
+        json={"revision": 1, "resolutions": [{"pointer": "/db/host", "value": "final"}]},
+    )
+    assert resp.status_code == 200, resp.text
+    result = resp.json()["result"]
+
+    resp = client.get(f"/merges/{mid}/patch")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["merge_id"] == mid
+    assert body["status"] == "resolved"
+
+    expected_base = {
+        "replicas": 1,
+        "image": "app:v1",
+        "db": {"host": "a", "port": 5432},
+        "tags": ["old"],
+        "removed": True,
+    }
+    assert body["base_sha256"] == _canonical_sha(expected_base)
+    assert body["result_sha256"] == _canonical_sha(result)
+
+    # Paths sorted lexicographically; array replaced wholesale; recursion.
+    paths = [op["path"] for op in body["patch"]]
+    assert paths == sorted(paths)
+    assert body["patch"] == [
+        {"op": "replace", "path": "/db/host", "value": "final"},
+        {"op": "replace", "path": "/db/port", "value": 5433},
+        {"op": "replace", "path": "/image", "value": "app:v2"},
+        {"op": "remove", "path": "/removed"},
+        {"op": "replace", "path": "/replicas", "value": 3},
+        {"op": "replace", "path": "/tags", "value": ["new"]},
+    ]
+
+    # Applying in the returned order must reproduce result exactly.
+    assert _apply_patch(copy.deepcopy(expected_base), body["patch"]) == result
+
+
+def test_patch_immediately_resolved_merge(client):
+    resp = client.post(
+        "/merges",
+        json={"base": {"a": 1}, "left": {"a": 2}, "right": {"a": 2}},
+    )
+    mid = resp.json()["merge_id"]
+    resp = client.get(f"/merges/{mid}/patch")
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body["patch"] == [{"op": "replace", "path": "/a", "value": 2}]
+    assert _apply_patch({"a": 1}, body["patch"]) == {"a": 2}
+    assert body["result_sha256"] == _canonical_sha({"a": 2})
+
+
+def test_patch_escapes_special_key_characters(client):
+    resp = client.post(
+        "/merges",
+        json={
+            "base": {"a/b": 1, "c~d": {"x": 1}},
+            "left": {"a/b": 2, "c~d": {"x": 2}},
+            "right": {"a/b": 2, "c~d": {"x": 2}},
+        },
+    )
+    mid = resp.json()["merge_id"]
+    body = client.get(f"/merges/{mid}/patch").json()
+    paths = [op["path"] for op in body["patch"]]
+    assert paths == ["/a~1b", "/c~0d/x"]
+    assert _apply_patch({"a/b": 1, "c~d": {"x": 1}}, body["patch"]) == {
+        "a/b": 2,
+        "c~d": {"x": 2},
+    }
 
 
 def test_health(client):

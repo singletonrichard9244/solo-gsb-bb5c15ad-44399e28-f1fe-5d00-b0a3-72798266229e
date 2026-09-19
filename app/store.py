@@ -7,7 +7,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 
-from . import db
+from . import db, patch
 from .merge import MISSING, delete_at, merge3, parse_pointer, set_at
 
 STATUS_PENDING = "pending"
@@ -16,6 +16,10 @@ STATUS_RESOLVED = "resolved"
 
 class MergeNotFound(Exception):
     pass
+
+
+class MergePending(Exception):
+    """The merge is still pending: no final result exists to diff against."""
 
 
 class StaleRevision(Exception):
@@ -182,3 +186,26 @@ def apply_resolutions(
         ),
     )
     return get_merge(merge_id)
+
+
+def get_merge_patch(merge_id: str) -> dict:
+    """Return the deterministic RFC 6902 patch from base_doc to result.
+
+    Raises MergeNotFound (404) for an unknown merge id and MergePending
+    (409) while conflicts remain open.
+    """
+    row = db.query_one("SELECT * FROM merges WHERE id = ?", (merge_id,))
+    if row is None:
+        raise MergeNotFound(merge_id)
+    if row["status"] != STATUS_RESOLVED:
+        raise MergePending(merge_id)
+
+    base = json.loads(row["base_doc"])
+    result = json.loads(row["result"])
+    return {
+        "merge_id": merge_id,
+        "status": STATUS_RESOLVED,
+        "patch": patch.build_patch(base, result),
+        "base_sha256": patch.sha256(base),
+        "result_sha256": patch.sha256(result),
+    }
