@@ -43,6 +43,7 @@ SQLite 数据文件持久化在名为 `merge-data` 的 Docker volume 中（容�
 | `POST` | `/merges` | 提交 base/left/right，创建合并单（支持幂等键） |
 | `GET` | `/merges/{merge_id}` | 状态查询：状态、revision、剩余冲突、最终结果 |
 | `POST` | `/merges/{merge_id}/resolutions` | 携带 revision 分批提交冲突取值 |
+| `GET` | `/merges/{merge_id}/patch` | resolved 后：base → result 的 RFC 6902 补丁（含 SHA-256） |
 | `GET` | `/health` | 健康检查 |
 
 ### 1. 创建合并单 — `POST /merges`
@@ -109,13 +110,57 @@ curl -s -X POST http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/re
 - 全部冲突解决后 `status` 变为 `resolved`，`result` 生成且**不可变**；此后再提交取值一律返回 `409`。
 - 对不存在的冲突指针取值返回 `400`；合并单不存在返回 `404`。
 
+### 4. 获取确定性补丁 — `GET /merges/{merge_id}/patch`
+
+合并单 `resolved` 后，可获取从**原始 `base_doc` 到最终 `result`** 的确定性操作序列（[RFC 6902 JSON Patch](https://www.rfc-editor.org/rfc/rfc6902)，路径为 [RFC 6901 JSON Pointer](https://www.rfc-editor.org/rfc/rfc6901)）：
+
+- **对象**按键递归生成 `add` / `remove` / `replace`；新增/删除的整个子树收敛为单条操作。
+- **数组整体 `replace`**（不逐下标生成操作）；标量与类型变化同样是单条 `replace`。
+- 路径中的 `~` 转义为 `~0`、`/` 转义为 `~1`；根文档路径为 `""`。
+- 操作按 **JSON Pointer 字典序稳定输出**，依次应用到 `base` 可精确重建 `result`。
+- 响应同时给出 `base` 与 `result` 的 **SHA-256**（基于规范化 JSON：键排序、无空白）。
+
+```bash
+curl -s http://localhost:8000/merges/bc6d2c3d9a3343bf9177147a10ec4023/patch
+```
+
+```json
+{
+  "merge_id": "bc6d2c3d9a3343bf9177147a10ec4023",
+  "status": "resolved",
+  "patch": [
+    {"op": "replace", "path": "/db/host", "value": "b"},
+    {"op": "replace", "path": "/db/port", "value": 5433},
+    {"op": "replace", "path": "/image", "value": "app:v2"},
+    {"op": "replace", "path": "/replicas", "value": 3}
+  ],
+  "base_sha256": "9f2c…（64 位十六进制）",
+  "result_sha256": "4a7e…（64 位十六进制）"
+}
+```
+
+含新增 / 删除 / 数组及特殊键名的例子：
+
+```json
+"patch": [
+  {"op": "add", "path": "/brand", "value": {"new": {"sub": true}}},
+  {"op": "remove", "path": "/gone"},
+  {"op": "replace", "path": "/list", "value": [1, 2, 3, 4]},
+  {"op": "replace", "path": "/weird~1a~0k", "value": [1, 2]}
+]
+```
+
+- 合并单尚为 `pending`（`result` 未生成）→ **`409`**。
+- 合并单不存在 → **`404`**。
+- 无冲突、创建即 `resolved` 的合并单可立即获取补丁（无变化时 `patch` 为 `[]`）。
+
 ## 本地开发与测试
 
 ```bash
 pip install -r requirements.txt
 pip install httpx pytest
 uvicorn app.main:app --reload --port 8000   # 本地运行
-python -m pytest tests/ -q                  # 运行测试（19 项）
+python -m pytest tests/ -q                  # 运行测试（32 项）
 ```
 
 ## 项目结构
@@ -124,10 +169,11 @@ python -m pytest tests/ -q                  # 运行测试（19 项）
 app/
   main.py    # FastAPI 路由与错误映射（404/409/400）
   merge.py   # 纯 Python 三方合并引擎（JSON Pointer 递归）
+  patch.py   # 确定性 RFC 6902 补丁生成 + 规范化 SHA-256
   store.py   # 合并单状态机：revision 校验、冲突解决、不可变结果
   db.py      # SQLite 连接与建表（启动时执行）
   models.py  # Pydantic 请求模型
-tests/       # 合并引擎单测 + API 端到端测试
+tests/       # 合并引擎/补丁单测 + API 端到端测试
 Dockerfile
 docker-compose.yml
 requirements.txt

@@ -177,6 +177,66 @@ def test_no_conflict_merge_is_immediately_resolved(client):
 
 def test_unknown_merge_404(client):
     assert client.get("/merges/does-not-exist").status_code == 404
+    assert client.get("/merges/does-not-exist/patch").status_code == 404
+
+
+def test_patch_pending_returns_409(client):
+    merge = create_merge(client)
+    assert merge["status"] == "pending"
+    resp = client.get(f"/merges/{merge['merge_id']}/patch")
+    assert resp.status_code == 409
+    assert "detail" in resp.json()
+
+
+def test_patch_for_resolved_merge(client):
+    merge = create_merge(client)
+    mid = merge["merge_id"]
+    resp = client.post(
+        f"/merges/{mid}/resolutions",
+        json={
+            "revision": 1,
+            "resolutions": [{"pointer": "/db/host", "value": "final-host"}],
+        },
+    )
+    assert resp.status_code == 200
+    result = resp.json()["result"]
+
+    resp = client.get(f"/merges/{mid}/patch")
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["merge_id"] == mid
+    assert body["status"] == "resolved"
+    assert body["patch"] == [
+        {"op": "replace", "path": "/db/host", "value": "final-host"},
+        {"op": "replace", "path": "/db/port", "value": 5433},
+        {"op": "replace", "path": "/image", "value": "app:v2"},
+        {"op": "replace", "path": "/replicas", "value": 3},
+    ]
+
+    # Digests are stable SHA-256 of canonical base / result.
+    from app.patch import sha256_hex
+
+    assert body["base_sha256"] == sha256_hex(BASE)
+    assert body["result_sha256"] == sha256_hex(result)
+    assert len(body["base_sha256"]) == 64
+
+    # Applying ops in the returned order to the base rebuilds the result.
+    from tests.patch_apply import apply_patch
+
+    assert apply_patch(BASE, body["patch"]) == result
+
+
+def test_patch_for_immediately_resolved_merge(client):
+    resp = client.post(
+        "/merges",
+        json={"base": {"a": 1, "b": 2}, "left": {"a": 9}, "right": {"a": 9}},
+    )
+    mid = resp.json()["merge_id"]
+    body = client.get(f"/merges/{mid}/patch").json()
+    assert body["patch"] == [
+        {"op": "remove", "path": "/b"},
+        {"op": "replace", "path": "/a", "value": 9},
+    ]
 
 
 def test_health(client):

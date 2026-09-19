@@ -50,6 +50,14 @@ async def already_resolved_handler(request: Request, exc: store.AlreadyResolved)
     )
 
 
+@app.exception_handler(store.MergeNotResolved)
+async def not_resolved_handler(request: Request, exc: store.MergeNotResolved):
+    return JSONResponse(
+        status_code=409,
+        content={"detail": "merge is pending: no result patch is available yet"},
+    )
+
+
 @app.exception_handler(store.UnknownConflictPointer)
 async def unknown_pointer_handler(request: Request, exc: store.UnknownConflictPointer):
     return JSONResponse(
@@ -90,6 +98,17 @@ def create_merge(
 def get_merge(merge_id: str):
     """Status query: state, revision, open conflicts, final result."""
     return store.get_merge(merge_id)
+
+
+@app.get("/merges/{merge_id}/patch")
+def get_merge_patch(merge_id: str):
+    """RFC 6902 patch from the original base_doc to the final result.
+
+    Available once the merge is resolved: 409 while pending, 404 if unknown.
+    The response also carries SHA-256 digests of base and result (canonical
+    JSON: sorted keys, no whitespace).
+    """
+    return store.get_merge_patch(merge_id)
 
 
 @app.post("/merges/{merge_id}/resolutions")

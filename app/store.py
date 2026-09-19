@@ -9,6 +9,7 @@ from typing import Any
 
 from . import db
 from .merge import MISSING, delete_at, merge3, parse_pointer, set_at
+from .patch import generate_patch, sha256_hex
 
 STATUS_PENDING = "pending"
 STATUS_RESOLVED = "resolved"
@@ -16,6 +17,10 @@ STATUS_RESOLVED = "resolved"
 
 class MergeNotFound(Exception):
     pass
+
+
+class MergeNotResolved(Exception):
+    """Raised when the deterministic patch is requested before resolution."""
 
 
 class StaleRevision(Exception):
@@ -61,6 +66,31 @@ def get_merge(merge_id: str) -> dict:
     if row is None:
         raise MergeNotFound(merge_id)
     return _row_to_dict(row)
+
+
+def get_merge_patch(merge_id: str) -> dict:
+    """Return the RFC 6902 patch from base_doc to the immutable result.
+
+    Raises MergeNotFound (404) for an unknown merge and MergeNotResolved
+    (409) while the merge is still pending.
+    """
+    row = db.query_one(
+        "SELECT status, base_doc, result FROM merges WHERE id = ?",
+        (merge_id,),
+    )
+    if row is None:
+        raise MergeNotFound(merge_id)
+    if row["status"] != STATUS_RESOLVED or row["result"] is None:
+        raise MergeNotResolved(merge_id)
+    base = json.loads(row["base_doc"])
+    result = json.loads(row["result"])
+    return {
+        "merge_id": merge_id,
+        "status": STATUS_RESOLVED,
+        "patch": generate_patch(base, result),
+        "base_sha256": sha256_hex(base),
+        "result_sha256": sha256_hex(result),
+    }
 
 
 def create_merge(
